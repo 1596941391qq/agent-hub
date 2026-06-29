@@ -8,9 +8,14 @@
 # 用法：
 #   hub ls                 列出所有 cc-* 会话：项目路径 + git 远端/状态
 #   hub peek <cc> [行数]   看某个 cc 最近 N 行屏幕(默认 40)，知道它在干嘛
-#   hub say  <cc> "消息"   给某 cc 发消息(自动包 agent 间通讯 preamble)
+#   hub say  <cc> "消息"   给某 cc 发消息(自动包 agent 间通讯 preamble)  ← 默认就用这个
 #   hub ask  <cc> "消息"   同 say，但要求对方用 `hub say <我> "..."` 回信
-#   hub all  "消息"        广播给除自己外的所有 cc
+#   hub all  "消息"        广播给除自己外的所有 cc  ← 慎用!需 HUB_ALL_OK=1 才放行
+#
+# 纪律(防滥用/防误传):
+#   · 默认【定向】say/ask 发给某一个 cc;不要图省事用 all 把私事广播给全员。
+#   · all 是例外:仅用于真·全员公告(如 FF 收口/全员停手),且必须显式 HUB_ALL_OK=1 才发。
+#   · 拿不准对方是否在输入框先 `hub peek`;别习惯性 HUB_FORCE=1 硬发(会绕过就绪护栏=误传根源)。
 #
 # <cc> 可写全名(cc-frontend)或片段(front / back / docs)，唯一匹配即可。
 # 设计：cc 之间的"对话"双向都走 hub say —— 不抓屏解析回复，对方看完直接 hub say 回来。
@@ -30,13 +35,21 @@ _self_path(){ [ -n "${TMUX:-}" ] && tmux display-message -p '#{pane_current_path
 
 # 片段 → 唯一 cc-* 会话名(打到 stdout)；失败打错误到 stderr 并返回非 0
 _resolve(){
-  local q="$1" hits n
-  if [[ "$q" == ${PREFIX}* ]] && tmux has-session -t "$q" 2>/dev/null; then echo "$q"; return 0; fi
-  if tmux has-session -t "${PREFIX}${q}" 2>/dev/null; then echo "${PREFIX}${q}"; return 0; fi
-  hits="$(_sessions | grep -i -- "$q" || true)"
+  local q="$1" all want hits n
+  all="$(_sessions)"
+  # 1) 精确会话名优先:用【真实会话清单】精确比对(grep -xF),不用 tmux has-session
+  #    ——tmux has-session -t 本身做前缀模糊匹配(cc-0620 会静默命中 cc-0620-044605),会架空精确判断、酿成误发。
+  want="$q"; [[ "$q" == ${PREFIX}* ]] || want="${PREFIX}${q}"
+  if printf '%s\n' "$all" | grep -qxF -- "$want"; then echo "$want"; return 0; fi
+  # 2) 退化到子串匹配:-F 固定串(避免 label 含正则元字符误伤)
+  hits="$(printf '%s\n' "$all" | grep -iF -- "$q" || true)"
   n="$(printf '%s\n' "$hits" | grep -c . || true)"
-  if [ "$n" -eq 1 ]; then echo "$hits"; return 0; fi
-  if [ "$n" -eq 0 ]; then echo "⛔ 没有匹配 '$q' 的 cc 会话。现有：$(_sessions | paste -sd' ' -)" >&2; return 2; fi
+  if [ "$n" -eq 1 ]; then
+    # 模糊唯一命中:警告到 stderr(不污染被捕获的 stdout),让发送方有机会发现是否发错对象
+    echo "ℹ️  '$q' 非精确会话名,模糊命中唯一会话 → $hits(确认是你要发的对象;精确请写全 ${PREFIX}<label>)" >&2
+    echo "$hits"; return 0
+  fi
+  if [ "$n" -eq 0 ]; then echo "⛔ 没有匹配 '$q' 的 cc 会话。现有：$(printf '%s\n' "$all" | paste -sd' ' -)" >&2; return 2; fi
   echo "⛔ '$q' 匹配多个：$(printf '%s ' $hits)，写清楚点。" >&2; return 2
 }
 
@@ -75,7 +88,8 @@ _send_line(){
 # HUB_FORCE=1 = 跳过本检查、无条件强发(仅用于护栏误判「未就绪」时);它【不会】让发进
 #   shell/模态变安全,只是强发,慎用。
 _ready(){
-  [ "${HUB_FORCE:-}" = "1" ] && return 0
+  # HUB_FORCE=1 跳过就绪检查并【大声告警】:硬发是误传根源,不能再静默。仅在确认护栏误判时用。
+  [ "${HUB_FORCE:-}" = "1" ] && { echo "⚠️  HUB_FORCE=1 强发,已跳过就绪护栏——若对方不在输入框,内容会落进 shell/弹窗=误传。务必先 hub peek 确认。" >&2; return 0; }
   local prompt
   prompt="$(tmux capture-pane -t "$1" -p 2>/dev/null | tail -6 | grep -F '❯' | tail -1)"
   [ -n "$prompt" ] || return 1                                  # 无 ❯:shell默认提示符/菜单/死pane → 拒
@@ -136,6 +150,13 @@ case "$cmd" in
     ;;
   all)
     msg="$*"; [ -z "$msg" ] && { echo "⛔ 消息为空" >&2; exit 2; }
+    # 防滥用闸:广播是例外,必须显式 HUB_ALL_OK=1 才放行。日常协作请用定向 hub say <cc>。
+    if [ "${HUB_ALL_OK:-}" != "1" ]; then
+      echo "⛔ hub all 是【全员广播】,默认禁用以防刷屏/误传。" >&2
+      echo "   · 给某个 cc 说话请用定向: hub say <cc> \"...\"" >&2
+      echo "   · 确为真·全员公告(FF收口/全员停手等),再显式: HUB_ALL_OK=1 hub all \"...\"" >&2
+      exit 4
+    fi
     me_sess="$(_self_sess)"; sent=0; skipped=0
     while IFS= read -r s; do
       [ -z "$s" ] && continue
