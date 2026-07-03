@@ -55,6 +55,10 @@ _resolve(){
 
 # 文本与回车之间的停顿(秒)。可用环境变量 HUB_SEND_PAUSE 覆盖(接收方很卡可调大)。
 HUB_SEND_PAUSE="${HUB_SEND_PAUSE:-0.3}"
+# 去重窗口(秒):同一接收方在此窗口内收到【完全相同】的消息=判为重复(外层重试/双击命令/并发竞态所致),跳过第二次。0=关闭。
+HUB_DEDUP_WINDOW="${HUB_DEDUP_WINDOW:-8}"
+# 广播节流(秒):hub all 每个接收方之间的间隔。避免 N 个 agent 被同时唤醒→同时打 Claude API→触发服务端限流("Rate limited")。0=不节流。
+HUB_ALL_STAGGER="${HUB_ALL_STAGGER:-1.5}"
 
 # 安全发送一行(无换行)到某会话当前 pane：先打字面文本(不带回车)→ 停顿 → 再回车提交。
 #   为什么要停顿:接收方【空闲】停在提示符上时,若 Enter 紧贴文本零延迟到达,会赶在输入框
@@ -70,6 +74,19 @@ _send_line(){
   local sess="$1" text="$2"
   {
     flock 9 2>/dev/null || true
+    # 去重护栏(在锁内做→并发也安全):同一接收方同一内容在 HUB_DEDUP_WINDOW 秒内重发=跳过。
+    # 根治「消息被重复发两次」——不管源头是外层重试/双击命令/两个 hub 并发,第二次都不再打进对方输入框。
+    if [ "${HUB_DEDUP_WINDOW:-0}" != "0" ]; then
+      local _h _now _dd _lh _lt
+      _h="$(printf '%s' "$text" | cksum | awk '{print $1"_"$2}')"
+      _now="$(date +%s)"; _dd="${TMPDIR:-/tmp}/hub-dedup-${sess}"
+      [ -f "$_dd" ] && read -r _lh _lt < "$_dd" 2>/dev/null
+      if [ "$_lh" = "$_h" ] && [ "$(( _now - ${_lt:-0} ))" -lt "$HUB_DEDUP_WINDOW" ]; then
+        echo "⏭️  跳过重复:${HUB_DEDUP_WINDOW}s 内已给 $sess 发过完全相同的消息(HUB_DEDUP_WINDOW=0 可关)" >&2
+        return 0
+      fi
+      printf '%s %s\n' "$_h" "$_now" > "$_dd"
+    fi
     tmux send-keys -t "$sess" -l "$text"
     sleep "$HUB_SEND_PAUSE" 2>/dev/null || sleep 0.3   # 非数字值(typo/locale 0,3)兜底,别退回零延迟竞态
     tmux send-keys -t "$sess" Enter
@@ -158,10 +175,12 @@ case "$cmd" in
       exit 4
     fi
     me_sess="$(_self_sess)"; sent=0; skipped=0
+    [ "${HUB_ALL_STAGGER:-0}" != "0" ] && echo "(广播节流:每个接收方间隔 ${HUB_ALL_STAGGER}s,避免同时唤醒全员打爆 Claude API 被限流;HUB_ALL_STAGGER=0 可关)" >&2
     while IFS= read -r s; do
       [ -z "$s" ] && continue
       [ "$s" = "$me_sess" ] && continue
       _ready "$s" || { echo "·  跳过 $s(看着不在 Claude 文本输入框)"; skipped=$((skipped+1)); continue; }
+      [ "$sent" -gt 0 ] && [ "${HUB_ALL_STAGGER:-0}" != "0" ] && { sleep "$HUB_ALL_STAGGER" 2>/dev/null || true; }   # 节流:相邻两次发送之间停一下,分散接收方的 API 调用
       line="$(_wrap "${s#$PREFIX}" "$msg" 0)"
       _send_line "$s" "$line"; echo "✅ → $s"; sent=$((sent+1))
     done <<< "$(_sessions)"
